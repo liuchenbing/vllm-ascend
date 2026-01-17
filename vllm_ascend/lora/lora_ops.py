@@ -57,6 +57,42 @@ def bgmv_expand_slice(inputs: torch.Tensor,
                                            slice_offset, slice_size)
 
 
+def bgmv_fused(inputs: torch.Tensor,
+               lora_a_weights: torch.Tensor,
+               lora_b_weights: torch.Tensor,
+               output_tensor: torch.Tensor,
+               lora_indices_tensor: torch.Tensor,
+               scaling: float = 1.0):
+    """
+    Fused bgmv operation combining shrink and expand phases.
+    
+    This function performs the following computation in a single kernel:
+        buffer = (inputs @ lora_a_weights) * scaling  (shrink phase)
+        output_tensor += buffer @ lora_b_weights      (expand phase)
+    
+    The intermediate buffer stays in L2 cache, avoiding global memory writes/reads.
+    
+    Args:
+        inputs: Input tensor of shape [batch_size, input_hidden_dim]
+        lora_a_weights: LoRA A weights of shape [num_loras, input_hidden_dim, max_lora_rank]
+        lora_b_weights: LoRA B weights of shape [num_loras, max_lora_rank, output_hidden_dim]
+        output_tensor: Output tensor of shape [batch_size, output_hidden_dim] (modified in-place)
+        lora_indices_tensor: LoRA indices of shape [batch_size]
+        scaling: Scaling factor for the operation
+    
+    Returns:
+        None (output_tensor is modified in-place)
+    """
+    return torch.ops._C_ascend.bgmv_fused(
+        inputs,
+        lora_a_weights,
+        lora_b_weights,
+        lora_indices_tensor,
+        output_tensor,
+        scaling,
+    )
+
+
 def sgmv_shrink(
     inputs: torch.Tensor,
     lora_a_weights: torch.Tensor,

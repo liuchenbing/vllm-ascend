@@ -91,6 +91,22 @@ namespace vllm_ascend {
         uint32_t slice_offset,
         uint32_t output_full_dim);
 
+    extern void bgmv_fused_impl(
+        AscendType type,
+        void *stream,
+        void *x,
+        void *lora_a_weight,
+        void *lora_b_weight,
+        void *indices,
+        uint32_t indicesSize,
+        void *y,
+        uint32_t batch_size,
+        uint32_t num_tokens_per_core,
+        uint32_t input_hidden_dim,
+        uint32_t max_lora_rank,
+        uint32_t output_hidden_dim,
+        float scale);
+
     extern void sgmv_shrink_impl(
         AscendType type,
         void *stream,

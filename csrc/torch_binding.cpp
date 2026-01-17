@@ -482,6 +482,60 @@ at::Tensor bgmv_expand(at::Tensor &x, at::Tensor &weight, at::Tensor &indices, a
     return y_out;
 }
 
+void bgmv_fused(at::Tensor &x, at::Tensor &lora_a_weight, at::Tensor &lora_b_weight, at::Tensor &indices, at::Tensor &y, double scale)
+{
+    at::ScalarType scalar_type = x.scalar_type();
+    TORCH_CHECK(scalar_type == torch::kHalf || scalar_type == torch::kBFloat16, "only support half and bf16");
+    TORCH_CHECK(x.dim() == 2, "x should be [batch_size, input_hidden_dim]");
+    TORCH_CHECK(lora_a_weight.dim() == 3 || lora_a_weight.dim() == 4,
+                "lora_a_weight should be [num_loras, input_hidden_dim, max_lora_rank] or [num_loras, 1, input_hidden_dim, max_lora_rank]");
+    TORCH_CHECK(lora_b_weight.dim() == 3 || lora_b_weight.dim() == 4,
+                "lora_b_weight should be [num_loras, max_lora_rank, output_hidden_dim] or [num_loras, 1, max_lora_rank, output_hidden_dim]");
+    TORCH_CHECK(y.dim() == 2, "y should be [batch_size, output_hidden_dim]");
+    TORCH_CHECK(indices.dim() == 1, "indices should be [batch_size]");
+    TORCH_CHECK(x.size(0) == y.size(0) && x.size(0) == indices.size(0),
+                "the first dimension of x, y, indices should be same");
+
+    // Handle 4D weight tensors (flatten to 3D)
+    at::Tensor lora_a_flat = lora_a_weight;
+    at::Tensor lora_b_flat = lora_b_weight;
+    if (lora_a_weight.dim() == 4) {
+        lora_a_flat = lora_a_weight.view({lora_a_weight.size(0), lora_a_weight.size(2), lora_a_weight.size(3)});
+    }
+    if (lora_b_weight.dim() == 4) {
+        lora_b_flat = lora_b_weight.view({lora_b_weight.size(0), lora_b_weight.size(2), lora_b_weight.size(3)});
+    }
+
+    void* x_ptr = x.data_ptr();
+    void* lora_a_ptr = lora_a_flat.data_ptr();
+    void* lora_b_ptr = lora_b_flat.data_ptr();
+    void* indices_ptr = indices.data_ptr();
+    int indices_size = indices.size(0);
+    void* y_ptr = y.data_ptr();
+    int batch_size = x.size(0);
+    int input_hidden_dim = x.size(1);
+    int max_lora_rank = lora_a_flat.size(2);
+    int output_hidden_dim = y.size(1);
+    float scale_f = static_cast<float>(scale);
+    aclrtStream stream = c10_npu::getCurrentNPUStream().stream();
+    at_npu::native::OpCommand cmd;
+    cmd.Name("bgmv_fused");
+    cmd.SetCustomHandler([scalar_type, stream, x_ptr, lora_a_ptr, lora_b_ptr, indices_ptr, indices_size, y_ptr, batch_size,
+                          input_hidden_dim, max_lora_rank, output_hidden_dim, scale_f]() -> int {
+        auto dtype = get_dtype_from_torch(scalar_type);
+        int device_id = 0;
+        int64_t aiv_num = 0;
+        TORCH_CHECK(aclGetDeviceCapability(device_id, ACL_DEVICE_INFO_VECTOR_CORE_NUM, &aiv_num) == ACL_SUCCESS);
+        int num_tokens_per_core = (batch_size + aiv_num - 1) / aiv_num;
+        TORCH_CHECK("num_tokens_per_core != 0", "num_tokens_per_core should not be 0");
+        bgmv_fused_impl(dtype, stream, x_ptr, lora_a_ptr, lora_b_ptr, indices_ptr, indices_size, y_ptr, batch_size,
+                        num_tokens_per_core, input_hidden_dim, max_lora_rank, output_hidden_dim, scale_f);
+        return 0;
+    });
+    cmd.Run();
+    return;
+}
+
 void sgmv_shrink(at::Tensor &x, at::Tensor &weight, at::Tensor &lora_indices, at::Tensor &seq_len,
                  at::Tensor &y, double scale)
 {
@@ -1306,6 +1360,10 @@ TORCH_LIBRARY_EXPAND(CONCAT(_C, _ascend), ops)
         "bgmv_expand(Tensor! x, Tensor! weight, Tensor! indices, Tensor! y,"
         "            int slice_offset, int slice_size) -> Tensor");
     ops.impl("bgmv_expand", torch::kPrivateUse1, &vllm_ascend::bgmv_expand);
+
+    ops.def(
+        "bgmv_fused(Tensor! x, Tensor! lora_a_weight, Tensor! lora_b_weight, Tensor! indices, Tensor! y, float scale) -> ()");
+    ops.impl("bgmv_fused", torch::kPrivateUse1, &vllm_ascend::bgmv_fused);
 
     ops.def("sgmv_shrink(Tensor! x, Tensor! weight, Tensor! lora_indices, Tensor! seq_len, Tensor! y, float scale) -> ()");
     ops.impl("sgmv_shrink", torch::kPrivateUse1, &vllm_ascend::sgmv_shrink);

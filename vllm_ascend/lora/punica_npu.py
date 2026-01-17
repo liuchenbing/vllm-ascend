@@ -35,12 +35,15 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                                                  bgmv_shrink, sgmv_expand,
                                                  sgmv_expand_slice,
                                                  sgmv_shrink)
+            self.bgmv_fused = None  # Fused kernel not available for 310P or large ranks
         else:
             from vllm_ascend.lora.lora_ops import (bgmv_expand,
                                                    bgmv_expand_slice,
-                                                   bgmv_shrink, sgmv_expand,
+                                                   bgmv_shrink, bgmv_fused,
+                                                   sgmv_expand,
                                                    sgmv_expand_slice,
                                                    sgmv_shrink)
+            self.bgmv_fused = bgmv_fused
         self.bgmv_expand = bgmv_expand
         self.bgmv_expand_slice = bgmv_expand_slice
         self.bgmv_shrink = bgmv_shrink
@@ -179,6 +182,66 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             dtype=torch.float32,
             device=device
         )
+
+    def _group_indices_by_lora(
+        self,
+        indices: torch.Tensor,
+        min_group_size: int = 4
+    ) -> Tuple[torch.Tensor, ...]:
+        """
+        Group token indices by their LoRA adapter ID to enable batch processing.
+
+        This optimization reduces kernel launch overhead by processing tokens
+        with the same LoRA adapter together.
+
+        Args:
+            indices: LoRA indices tensor of shape (batch_size,)
+            min_group_size: Minimum group size to enable batching (default: 4).
+                Groups smaller than this will be processed individually.
+
+        Returns:
+            Tuple of (group_indices, group_lora_ids) where:
+            - group_indices: List of tensors, each containing token indices for
+              tokens using the same LoRA adapter
+            - group_lora_ids: List of LoRA adapter IDs corresponding to each group
+        """
+        if indices is None or indices.numel() == 0:
+            return (), ()
+
+        # Get unique LoRA IDs and their counts
+        unique_lora_ids, inverse_indices, counts = torch.unique(
+            indices, return_inverse=True, return_counts=True
+        )
+
+        # Filter out invalid LoRA IDs (< 0)
+        valid_mask = unique_lora_ids >= 0
+        unique_lora_ids = unique_lora_ids[valid_mask]
+        counts = counts[valid_mask]
+
+        if len(unique_lora_ids) == 0:
+            return (), ()
+
+        # Create groups: only batch tokens with same LoRA if group size >= min_group_size
+        group_indices_list = []
+        group_lora_ids_list = []
+
+        for lora_id, count in zip(unique_lora_ids, counts):
+            # Get all token indices for this LoRA ID
+            token_mask = (indices == lora_id.item())
+            token_indices = torch.nonzero(token_mask, as_tuple=False).squeeze(-1)
+
+            if count >= min_group_size:
+                # Large enough group: batch process
+                group_indices_list.append(token_indices)
+                group_lora_ids_list.append(lora_id.item())
+            else:
+                # Small group: process individually (current kernel handles this efficiently)
+                # We still return them but mark for individual processing
+                for idx in token_indices:
+                    group_indices_list.append(idx.unsqueeze(0))
+                    group_lora_ids_list.append(lora_id.item())
+
+        return tuple(group_indices_list), tuple(group_lora_ids_list)
 
     def _shrink_prefill(
         self,
@@ -498,11 +561,18 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             lora_b_stacked (torch.Tensor): lora_b's weights.
             add_inputs (bool): Default to True.
         """
+        # Early return if no LoRA request
+        if self.no_lora:
+            return
 
         # Embedding layer only need expand op
         expand_fun: Callable = (self._expand_prefill
                                 if self.is_prefill else self._expand_decode)
-        x = x.to(torch.float32)
+
+        # Optimization: avoid unnecessary type conversion if already float32
+        if x.dtype != torch.float32:
+            x = x.to(torch.float32)
+
         expand_fun(y, x, lora_b_stacked, add_inputs)
 
     def add_lora_linear(self,
@@ -538,6 +608,9 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             buffer (Optional[Tuple[torch.Tensor, ...]]): Defaults to None.
                 If None, pre-allocated buffers will be used when available.
         """
+        # Early return if no LoRA request - avoid unnecessary buffer allocation
+        if self.no_lora:
+            return
 
         assert len(lora_a_stacked) == len(lora_b_stacked) == len(output_slices)
 
@@ -584,17 +657,34 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             buffer (Optional[torch.Tensor]): Default to None.
                 If None, pre-allocated buffer will be used when available.
         """
+        # Early return if no LoRA request - avoid unnecessary buffer allocation
+        # Note: add_lora_logits uses sampler_indices which may differ from
+        # token_lora_indices, so we check if all indices are -1
+        indices = self.sampler_indices
+        if indices is None or (indices < 0).all():
+            return
+
         y_org = y
         y = y.view(-1, y.shape[-1])
         x = x.view(-1, x.shape[-1])
         lora_rank = lora_b_stacked.size(-1)
         batch_size = x.size(0)
 
+        # Use fused kernel if available (for decode stage, single slice)
+        # This avoids intermediate buffer writes to global memory
+        if (self.bgmv_fused is not None
+                and not self.is_prefill
+                and lora_a_stacked.dim() == 3
+                and lora_b_stacked.dim() == 3):
+            # Fused kernel: directly compute y += (x @ lora_a * scale) @ lora_b
+            self.bgmv_fused(x, lora_a_stacked, lora_b_stacked, indices, y, scale)
+            y = y.view_as(y_org)
+            return
+
+        # Fall back to separate shrink/expand kernels
         if buffer is None:
             # Use pre-allocated buffer to avoid repeated memory allocation
             buffer = self._get_logits_buffer(batch_size, lora_rank, x.device)
-
-        indices = self.sampler_indices
 
         self.bgmv_shrink(x, lora_a_stacked, buffer, indices, scale)
         self.bgmv_expand(buffer, lora_b_stacked, y, indices, add_inputs=True)
