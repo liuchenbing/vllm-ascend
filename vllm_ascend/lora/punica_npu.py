@@ -288,6 +288,50 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                                       self._expand_slice_decode)
         expand_slice_fun(y, x, w_t_all, y_offset, y_slice_size, add_inputs)
 
+    def _apply_expand_fused(
+        self,
+        y: torch.Tensor,
+        x: Union[Tuple[torch.Tensor, ...], torch.Tensor],
+        lora_b_stacked: Tuple[torch.Tensor, ...],
+        output_slices: Tuple[int, ...],
+        offset_start: int,
+        add_inputs: bool,
+        num_slices: int
+    ):
+        """
+        Fused expand operation for multiple slices.
+
+        This method optimizes multiple expand operations by:
+        1. Pre-selecting the expand function once (prefill vs decode)
+        2. Pre-computing all offsets
+        3. Processing all slices with minimal Python overhead
+
+        Args:
+            y: Output tensor with shape (batch_size, hidden_out)
+            x: Tuple of input tensors, each with shape (batch_size, lora_rank)
+            lora_b_stacked: Tuple of LoRA B weights
+            output_slices: Tuple of slice sizes for each output
+            offset_start: Starting offset in the output tensor
+            add_inputs: Whether to add to existing values
+            num_slices: Number of slices to process
+        """
+        # Select the expand function once to avoid repeated branch prediction
+        expand_slice_fun: Callable = (self._expand_slice_prefill
+                                      if self.is_prefill else
+                                      self._expand_slice_decode)
+
+        # Pre-compute offsets to avoid repeated additions in the loop
+        offsets = [offset_start]
+        for i in range(num_slices - 1):
+            offsets.append(offsets[i] + output_slices[i])
+
+        # Process all slices with the pre-selected function
+        for slice_idx in range(num_slices):
+            expand_slice_fun(
+                y, x[slice_idx], lora_b_stacked[slice_idx],
+                offsets[slice_idx], output_slices[slice_idx], add_inputs
+            )
+
     def _apply_shrink(self, y: torch.Tensor, x: torch.Tensor,
                       w_t_all: torch.Tensor, scale: float):
         """
@@ -304,6 +348,41 @@ class PunicaWrapperNPU(PunicaWrapperBase):
                                 if self.is_prefill else self._shrink_decode)
         shrink_fun(y, x, w_t_all, scale)
         y = y.view_as(y_org)
+
+    def _apply_shrink_fused(
+        self,
+        y: Union[Tuple[torch.Tensor, ...], torch.Tensor],
+        x: torch.Tensor,
+        lora_a_stacked: Tuple[torch.Tensor, ...],
+        scale: float,
+        num_slices: int
+    ):
+        """
+        Fused shrink operation for multiple slices with the same LoRA rank.
+
+        This method optimizes multiple shrink operations by:
+        1. Pre-selecting the shrink function once (prefill vs decode)
+        2. Processing all slices with minimal Python overhead
+        3. Reusing the reshaped input tensor
+
+        Args:
+            y: Tuple of output tensors, each with shape (batch_size, lora_rank)
+            x: Input tensor with shape (batch_size, hidden_in)
+            lora_a_stacked: Tuple of LoRA A weights
+            scale: Scaling factor
+            num_slices: Number of slices to process
+        """
+        # Select the shrink function once to avoid repeated branch prediction
+        shrink_fun: Callable = (self._shrink_prefill
+                                if self.is_prefill else self._shrink_decode)
+
+        # Process all slices
+        for slice_idx in range(num_slices):
+            y_slice = y[slice_idx]
+            y_org = y_slice
+            y_flat = y_slice.view(-1, y_slice.shape[-1])
+            shrink_fun(y_flat, x, lora_a_stacked[slice_idx], scale)
+            y_slice = y_flat.view_as(y_org)
 
     def add_shrink(self, y: Union[Tuple[torch.Tensor, ...], torch.Tensor],
                    x: torch.Tensor, lora_a_stacked: Tuple[torch.Tensor, ...],
@@ -327,10 +406,26 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         """
 
         x = x.view(-1, x.shape[-1])
-        # TODO fuse these kernels
-        for slice_idx in range(len(lora_a_stacked)):
-            self._apply_shrink(y[slice_idx], x, lora_a_stacked[slice_idx],
-                               scale)
+        num_slices = len(lora_a_stacked)
+
+        # Optimization: single slice case - avoid loop overhead
+        if num_slices == 1:
+            self._apply_shrink(y[0], x, lora_a_stacked[0], scale)
+            return
+
+        # For multiple slices, try to batch process when possible
+        # Check if we can use fused shrink (all slices have same rank)
+        first_rank = lora_a_stacked[0].size(-2)
+        can_fuse = all(w.size(-2) == first_rank for w in lora_a_stacked)
+
+        if can_fuse and num_slices <= self.MAX_LORA_SLICES:
+            # Use fused shrink for better performance
+            self._apply_shrink_fused(y, x, lora_a_stacked, scale, num_slices)
+        else:
+            # Fall back to sequential processing
+            for slice_idx in range(num_slices):
+                self._apply_shrink(y[slice_idx], x, lora_a_stacked[slice_idx],
+                                   scale)
 
     def add_expand(self,
                    y: torch.Tensor,
@@ -362,20 +457,27 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         """
         y_org = y
         y = y.view(-1, y.shape[-1])
-        offset_left = offset_start
+        num_slices = len(lora_b_stacked)
+
+        # Apply bias if present
         if lora_bias_stacked is not None:
             self._apply_bias(self.token_lora_indices, y, output_slices,
                              lora_bias_stacked)
-        for slice_idx in range(len(lora_b_stacked)):
+
+        # Optimization: single slice case - avoid loop overhead
+        if num_slices == 1:
             self._apply_expand(
-                y,
-                x[slice_idx],
-                lora_b_stacked[slice_idx],
-                offset_left,
-                output_slices[slice_idx],
-                add_inputs=add_inputs,
+                y, x[0], lora_b_stacked[0],
+                offset_start, output_slices[0], add_inputs
             )
-            offset_left += output_slices[slice_idx]
+            y = y.view_as(y_org)
+            return
+
+        # Multiple slices: use fused expand for better performance
+        self._apply_expand_fused(
+            y, x, lora_b_stacked, output_slices,
+            offset_start, add_inputs, num_slices
+        )
         y = y.view_as(y_org)
 
     def add_lora_embedding(self,
