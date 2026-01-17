@@ -18,6 +18,9 @@ class PunicaWrapperNPU(PunicaWrapperBase):
     Multi-LoRA, and to provide the interface for the pytorch punica ops.
     """
 
+    # Maximum number of slices for LoRA operations (QKV has 3 slices)
+    MAX_LORA_SLICES = 3
+
     def __init__(self, max_num_batched_tokens: int, max_batches: int,
                  device: Union[torch.device, str], **kwargs):
         PunicaWrapperBase.__init__(self, max_num_batched_tokens, max_batches,
@@ -44,6 +47,138 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         self.sgmv_expand = sgmv_expand
         self.sgmv_expand_slice = sgmv_expand_slice
         self.sgmv_shrink = sgmv_shrink
+
+        # Pre-allocate buffers for LoRA operations to avoid repeated memory
+        # allocation. The buffers are allocated based on max_num_batched_tokens
+        # and max_lora_rank to accommodate the largest possible batch size.
+        self._max_num_batched_tokens = max_num_batched_tokens
+        self._init_lora_buffers(device)
+
+    def _init_lora_buffers(self, device: Union[torch.device, str]) -> None:
+        """
+        Pre-allocate buffers for LoRA operations to avoid repeated memory
+        allocation during inference.
+
+        The buffers are allocated based on:
+        - max_num_batched_tokens: maximum number of tokens in a batch
+        - max_lora_rank: maximum LoRA rank from lora_config
+
+        These buffers will be reused across multiple calls to add_lora_linear
+        and add_lora_logits, reducing memory allocation overhead.
+        """
+        if self.lora_config is None:
+            # No LoRA config provided, skip buffer allocation
+            self._lora_buffers: Optional[Tuple[torch.Tensor, ...]] = None
+            self._logits_buffer: Optional[torch.Tensor] = None
+            return
+
+        max_lora_rank = self.lora_config.max_lora_rank
+
+        # Pre-allocate buffers for add_lora_linear (up to MAX_LORA_SLICES for
+        # QKV operations). We use float32 for intermediate computations to
+        # maintain numerical precision, consistent with the triton op.
+        self._lora_buffers = tuple(
+            torch.zeros(
+                (self._max_num_batched_tokens, max_lora_rank),
+                dtype=torch.float32,
+                device=device
+            )
+            for _ in range(self.MAX_LORA_SLICES)
+        )
+
+        # Pre-allocate buffer for add_lora_logits
+        self._logits_buffer = torch.zeros(
+            (self._max_num_batched_tokens, max_lora_rank),
+            dtype=torch.float32,
+            device=device
+        )
+
+    def _get_lora_buffers(
+        self,
+        batch_size: int,
+        lora_rank: int,
+        num_slices: int,
+        device: torch.device
+    ) -> Tuple[torch.Tensor, ...]:
+        """
+        Get pre-allocated buffers for LoRA linear operations.
+
+        If pre-allocated buffers are available and sufficient, return sliced
+        views of them. Otherwise, fall back to creating new buffers.
+
+        Args:
+            batch_size: Current batch size (number of tokens)
+            lora_rank: LoRA rank for the current operation
+            num_slices: Number of slices needed (e.g., 3 for QKV)
+            device: Device to create buffers on if needed
+
+        Returns:
+            Tuple of buffer tensors, each with shape (batch_size, lora_rank)
+        """
+        # Check if we can use pre-allocated buffers
+        if (self._lora_buffers is not None
+                and num_slices <= self.MAX_LORA_SLICES
+                and batch_size <= self._max_num_batched_tokens
+                and self.lora_config is not None
+                and lora_rank <= self.lora_config.max_lora_rank):
+            # Use sliced views of pre-allocated buffers
+            buffers = tuple(
+                self._lora_buffers[i][:batch_size, :lora_rank]
+                for i in range(num_slices)
+            )
+            # Zero out the buffers before use
+            for buf in buffers:
+                buf.zero_()
+            return buffers
+
+        # Fall back to creating new buffers if pre-allocated ones are
+        # insufficient
+        return tuple(
+            torch.zeros(
+                (batch_size, lora_rank),
+                dtype=torch.float32,
+                device=device
+            )
+            for _ in range(num_slices)
+        )
+
+    def _get_logits_buffer(
+        self,
+        batch_size: int,
+        lora_rank: int,
+        device: torch.device
+    ) -> torch.Tensor:
+        """
+        Get pre-allocated buffer for LoRA logits operations.
+
+        If pre-allocated buffer is available and sufficient, return a sliced
+        view of it. Otherwise, fall back to creating a new buffer.
+
+        Args:
+            batch_size: Current batch size (number of tokens)
+            lora_rank: LoRA rank for the current operation
+            device: Device to create buffer on if needed
+
+        Returns:
+            Buffer tensor with shape (batch_size, lora_rank)
+        """
+        # Check if we can use pre-allocated buffer
+        if (self._logits_buffer is not None
+                and batch_size <= self._max_num_batched_tokens
+                and self.lora_config is not None
+                and lora_rank <= self.lora_config.max_lora_rank):
+            # Use sliced view of pre-allocated buffer
+            buffer = self._logits_buffer[:batch_size, :lora_rank]
+            # Zero out the buffer before use
+            buffer.zero_()
+            return buffer
+
+        # Fall back to creating a new buffer
+        return torch.zeros(
+            (batch_size, lora_rank),
+            dtype=torch.float32,
+            device=device
+        )
 
     def _shrink_prefill(
         self,
@@ -299,18 +434,20 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             scale (float): Scaling factor.
             output_slices (Tuple[int, ...]): Every slice's size.
             buffer (Optional[Tuple[torch.Tensor, ...]]): Defaults to None.
+                If None, pre-allocated buffers will be used when available.
         """
 
         assert len(lora_a_stacked) == len(lora_b_stacked) == len(output_slices)
 
         if buffer is None:
-            r = lora_b_stacked[0].size(-1)
-            # We set the buffer to be float32 by default, consistent with the
-            # triton op
-            buffer = tuple(
-                torch.zeros(
-                    (x.size(0), r), dtype=torch.float32, device=x.device)
-                for _ in range(len(output_slices)))
+            # Get LoRA rank from lora_b weights
+            lora_rank = lora_b_stacked[0].size(-1)
+            batch_size = x.size(0)
+            num_slices = len(output_slices)
+            # Use pre-allocated buffers to avoid repeated memory allocation
+            buffer = self._get_lora_buffers(
+                batch_size, lora_rank, num_slices, x.device
+            )
         self.add_shrink(buffer, x, lora_a_stacked, scale, **kwargs)
         self.add_expand(y,
                         buffer,
@@ -342,17 +479,18 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             lora_a_stacked (torch.Tensor): lora_a's weights.
             lora_b_stacked (torch.Tensor):lora_b's weights.
             scale (float): Scaling factor.
-            buffer (Optional[torch.Tensor]):Default to None.
+            buffer (Optional[torch.Tensor]): Default to None.
+                If None, pre-allocated buffer will be used when available.
         """
         y_org = y
         y = y.view(-1, y.shape[-1])
         x = x.view(-1, x.shape[-1])
-        r = lora_b_stacked.size(-1)
+        lora_rank = lora_b_stacked.size(-1)
+        batch_size = x.size(0)
 
         if buffer is None:
-            buffer = torch.zeros((x.size(0), r),
-                                 dtype=torch.float32,
-                                 device=x.device)
+            # Use pre-allocated buffer to avoid repeated memory allocation
+            buffer = self._get_logits_buffer(batch_size, lora_rank, x.device)
 
         indices = self.sampler_indices
 
