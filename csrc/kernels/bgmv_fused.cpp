@@ -191,7 +191,7 @@ private:
         }
 
         // Handle remaining elements
-        ComputeExpandLastIteration(dupBuffer, numStreamOut, numOutputElementsPerInputTile, numStreamInPerOutputTile);
+        ComputeExpandLastIteration(dupBuffer, idx, numStreamOut, numOutputElementsPerInputTile, numStreamInPerOutputTile);
     }
 
     __aicore__ inline void CopyInY(const int64_t idx, int32_t progress, int32_t numElements = 4096) {
@@ -288,16 +288,45 @@ private:
 
     __aicore__ inline void ComputeExpandLastIteration(
         AscendC::LocalTensor<float> &dupBuffer,
+        const int64_t idx,
         int32_t numStreamOut,
         int32_t numOutputElementsPerInputTile,
         int32_t numStreamInPerOutputTile
     ) {
-        int32_t remainingY = outputHiddenDim_ % 4096;
+        static constexpr int32_t Y_OUT_TILE_NUM_ELEMENTS = 4096;
+        static constexpr int32_t W_IN_TILE_NUM_ELEMENTS = 8192;
+        static constexpr int32_t NUM_ELEMENTS_PER_REPEAT = 64;
+        static constexpr int32_t NUM_BLOCKS_PER_REPEAT = 8;
+
+        int32_t remainingY = outputHiddenDim_ % Y_OUT_TILE_NUM_ELEMENTS;
         if (remainingY == 0) {
             return;
         }
-        // Similar logic to bgmv_expand::ComputeLastIteration
-        // ... (implementation for remaining elements)
+
+        int32_t remainingW = remainingY * maxLoRARank_;
+        int32_t numCompleteWTileInForLastIteration = remainingW / W_IN_TILE_NUM_ELEMENTS;
+        int32_t remainingWForLastRepeat = remainingW % W_IN_TILE_NUM_ELEMENTS;
+
+        CopyInY(idx, numStreamOut, remainingY);
+
+        int32_t outputIdx = 0;
+        for (outputIdx = 0; outputIdx < numCompleteWTileInForLastIteration; outputIdx++) {
+            CopyInWB(numStreamOut * numStreamInPerOutputTile + outputIdx);
+            ComputeExpand(dupBuffer, outputIdx * numOutputElementsPerInputTile);
+        }
+
+        if (remainingWForLastRepeat != 0) {
+            CopyInWB(numStreamOut * numStreamInPerOutputTile + numCompleteWTileInForLastIteration,
+                    remainingWForLastRepeat);
+            int32_t lastRepeatCount = remainingWForLastRepeat / NUM_ELEMENTS_PER_REPEAT;
+            int32_t pairReduceRepeat16 = 
+                (lastRepeatCount * NUM_BLOCKS_PER_REPEAT + NUM_ELEMENTS_PER_REPEAT - 1) / NUM_ELEMENTS_PER_REPEAT;
+            int32_t pairReduceRepeat32 = (pairReduceRepeat16 + 1) / 2;
+            int32_t lastComputeOutputElement = outputIdx * numOutputElementsPerInputTile;
+            ComputeExpand(dupBuffer, lastComputeOutputElement, lastRepeatCount, pairReduceRepeat16, pairReduceRepeat32);
+        }
+
+        ScaleAndAddOutput(idx, numStreamOut, remainingY);
     }
 
     // Helper methods similar to bgmv_shrink and bgmv_expand

@@ -614,11 +614,27 @@ class PunicaWrapperNPU(PunicaWrapperBase):
 
         assert len(lora_a_stacked) == len(lora_b_stacked) == len(output_slices)
 
+        num_slices = len(output_slices)
+
+        # Optimization: Use fused kernel for single slice in decode stage
+        # This avoids intermediate buffer writes to global memory
+        if (num_slices == 1
+                and not self.is_prefill
+                and self.bgmv_fused is not None
+                and lora_a_stacked[0].dim() == 3
+                and lora_b_stacked[0].dim() == 3):
+            # Single slice decode stage: use bgmv_fused for better performance
+            lora_a = lora_a_stacked[0]
+            lora_b = lora_b_stacked[0]
+            # For single slice, y is already the correct shape
+            self.bgmv_fused(x, lora_a, lora_b, self.token_lora_indices, y, scale)
+            return
+
+        # Fall back to separate shrink/expand for multiple slices or when fused kernel unavailable
         if buffer is None:
             # Get LoRA rank from lora_b weights
             lora_rank = lora_b_stacked[0].size(-1)
             batch_size = x.size(0)
-            num_slices = len(output_slices)
             # Use pre-allocated buffers to avoid repeated memory allocation
             buffer = self._get_lora_buffers(
                 batch_size, lora_rank, num_slices, x.device
