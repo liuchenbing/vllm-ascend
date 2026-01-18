@@ -425,16 +425,72 @@ class PunicaWrapperNPU(PunicaWrapperBase):
 
         This method optimizes multiple shrink operations by:
         1. Pre-selecting the shrink function once (prefill vs decode)
-        2. Processing all slices with minimal Python overhead
+        2. For multiple slices with same rank: merge lora_a and call shrink once,
+           then split the result back to slices (inspired by SGLang optimization)
         3. Reusing the reshaped input tensor
 
         Args:
             y: Tuple of output tensors, each with shape (batch_size, lora_rank)
             x: Input tensor with shape (batch_size, hidden_in)
-            lora_a_stacked: Tuple of LoRA A weights
+            lora_a_stacked: Tuple of LoRA A weights, each with shape (num_loras, input_dim, rank)
             scale: Scaling factor
             num_slices: Number of slices to process
         """
+        # Optimization: For multiple slices with same rank, merge lora_a and use single shrink call
+        # This reduces kernel launch overhead from N calls to 1 call (similar to SGLang's approach)
+        # SGLang optimization: merge (num_loras, input_dim, rank) * N -> (num_loras, input_dim, total_rank)
+        # Then split output (batch_size, total_rank) -> (batch_size, rank) * N
+        if num_slices > 1:
+            # Check if all slices have the same rank (last dimension)
+            first_shape = lora_a_stacked[0].shape
+            first_rank = first_shape[-1]
+            all_same_rank = all(w.shape[-1] == first_rank for w in lora_a_stacked)
+            
+            # Check if all slices have same input_dim (second to last dimension)
+            first_input_dim = first_shape[-2]
+            all_same_input_dim = all(w.shape[-2] == first_input_dim for w in lora_a_stacked)
+            
+            if all_same_rank and all_same_input_dim and first_rank > 0:
+                # Merge lora_a tensors along the last dimension (rank dimension)
+                # Input: (num_loras, input_dim, rank) for each slice
+                # Merged: (num_loras, input_dim, total_rank)
+                lora_a_merged = torch.cat(lora_a_stacked, dim=-1)
+                
+                # Get batch size and rank info
+                batch_size = x.size(0)
+                rank_per_slice = first_rank
+                total_rank = rank_per_slice * num_slices
+                
+                # Create merged buffer by concatenating all slice buffers
+                # y is a tuple of buffers: (buffer_0, buffer_1, buffer_2, ...)
+                # Each buffer has shape (batch_size, rank_per_slice)
+                merged_buffer_list = []
+                for slice_idx in range(num_slices):
+                    y_slice_flat = y[slice_idx].view(-1, rank_per_slice)
+                    merged_buffer_list.append(y_slice_flat)
+                
+                # Concatenate along the rank dimension to form (batch_size, total_rank)
+                merged_buffer_flat = torch.cat(merged_buffer_list, dim=-1)
+                
+                # Call shrink once with merged lora_a (optimization: 1 kernel call vs N calls)
+                shrink_fun: Callable = (self._shrink_prefill
+                                        if self.is_prefill else self._shrink_decode)
+                shrink_fun(merged_buffer_flat, x, lora_a_merged, scale)
+                
+                # Split merged buffer back to individual slices and update y
+                for slice_idx in range(num_slices):
+                    y_slice = y[slice_idx]
+                    y_org = y_slice
+                    y_flat = y_slice.view(-1, rank_per_slice)
+                    # Copy from merged buffer (in-place update)
+                    slice_start = slice_idx * rank_per_slice
+                    slice_end = (slice_idx + 1) * rank_per_slice
+                    y_flat.copy_(merged_buffer_flat[:, slice_start:slice_end])
+                    y_slice = y_flat.view_as(y_org)
+                
+                return
+        
+        # Fallback: Process slices sequentially (original implementation)
         # Select the shrink function once to avoid repeated branch prediction
         shrink_fun: Callable = (self._shrink_prefill
                                 if self.is_prefill else self._shrink_decode)
