@@ -243,6 +243,51 @@ class PunicaWrapperNPU(PunicaWrapperBase):
 
         return tuple(group_indices_list), tuple(group_lora_ids_list)
 
+    def _get_decode_metadata(self) -> Tuple:
+        """
+        Prepare decode metadata for sgmv operations (similar to SGLang's approach).
+
+        For decode stage, convert token-level indices to sequence-level metadata:
+        - Each sequence has length 1 (decode stage)
+        - seq_len_tensor: all ones with shape [batch_size]
+        - lora_indices_tensor: token_lora_indices (each sequence corresponds to one token)
+
+        Returns:
+            Tuple of (b_seq_start_loc, seq_len_tensor, lora_indices_tensor, 
+                     batches, max_seq_length, token_nums) for sgmv operations
+        """
+        if self.token_lora_indices is None or self.token_lora_indices.numel() == 0:
+            batch_size = 0
+            device = self._lora_buffers[0].device if self._lora_buffers is not None else torch.device("cpu")
+        else:
+            batch_size = self.token_lora_indices.size(0)
+            device = self.token_lora_indices.device
+        
+        # For decode stage: each sequence has length 1
+        # Create seq_len_tensor with all ones (sequence-level, like SGLang)
+        if batch_size > 0:
+            seq_len_tensor = torch.ones(
+                batch_size, dtype=torch.int32, device=device
+            )
+            # b_seq_start_loc: cumulative sum of seq_lens [0, 1, 2, ..., batch_size]
+            b_seq_start_loc = torch.zeros(
+                batch_size + 1, dtype=torch.int32, device=device
+            )
+            b_seq_start_loc[1:] = torch.cumsum(seq_len_tensor, dim=0)
+            lora_indices_tensor = self.token_lora_indices
+        else:
+            seq_len_tensor = torch.zeros(0, dtype=torch.int32, device=device)
+            b_seq_start_loc = torch.zeros(1, dtype=torch.int32, device=device)
+            lora_indices_tensor = torch.zeros(0, dtype=torch.int32, device=device)
+        
+        # Other metadata
+        batches = batch_size
+        max_seq_length = 1  # Decode stage: each sequence has length 1
+        token_nums = batch_size
+        
+        return (b_seq_start_loc, seq_len_tensor, lora_indices_tensor, 
+                batches, max_seq_length, token_nums)
+
     def _shrink_prefill(
         self,
         y: torch.Tensor,
@@ -268,7 +313,11 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         w_t_all: torch.Tensor,
         scale: float,
     ):
-        self.bgmv_shrink(x, w_t_all, y, self.token_lora_indices, scale)
+        # Optimization: Use sgmv for decode stage (similar to SGLang)
+        # This provides better performance compared to bgmv
+        # For decode stage, we convert token-level indices to sequence-level metadata
+        decode_metadata = self._get_decode_metadata()
+        self.sgmv_shrink(x, w_t_all, y, *decode_metadata, scale)
 
     def _expand_prefill(
         self,
@@ -295,7 +344,10 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         w_t_all: torch.Tensor,
         add_inputs: bool,
     ):
-        self.bgmv_expand(x, w_t_all, y, self.token_lora_indices, add_inputs)
+        # Optimization: Use sgmv for decode stage (similar to SGLang)
+        # This provides better performance compared to bgmv
+        decode_metadata = self._get_decode_metadata()
+        self.sgmv_expand(x, w_t_all, y, *decode_metadata, add_inputs)
 
     def _expand_slice_prefill(
         self,
@@ -328,8 +380,10 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         y_slice_size: int,
         add_inputs: bool,
     ):
-        self.bgmv_expand_slice(x, w_t_all, y, self.token_lora_indices,
-                               y_offset, y_slice_size, add_inputs)
+        # Optimization: Use sgmv for decode stage (similar to SGLang)
+        # This provides better performance compared to bgmv
+        decode_metadata = self._get_decode_metadata()
+        self.sgmv_expand_slice(x, w_t_all, y, *decode_metadata, y_offset, y_slice_size, add_inputs)
 
     def _apply_expand(
         self,
