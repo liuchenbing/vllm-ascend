@@ -686,6 +686,68 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             self.bgmv_fused(x, lora_a, lora_b, self.token_lora_indices, y, scale)
             return
 
+        # Optimization: For QKV-like operations (multiple slices, same rank),
+        # use merged shrink to avoid multiple kernel calls (similar to SGLang)
+        # SGLang optimization: merge shrink (1 kernel call) + slice expand (N calls)
+        # This is more efficient than: separate shrink (N calls) + expand (N calls)
+        if (num_slices > 1
+                and num_slices <= self.MAX_LORA_SLICES):
+            # Check if all slices have the same rank (allows merging)
+            first_shape = lora_a_stacked[0].shape
+            if len(first_shape) == 3:
+                first_rank = first_shape[-1]
+                first_input_dim = first_shape[-2]
+                all_same_shape = all(
+                    w.shape == first_shape for w in lora_a_stacked
+                )
+                
+                # If all slices have same shape, use merged shrink (SGLang-style optimization)
+                if all_same_shape and first_rank > 0:
+                    # Merge lora_a: (num_loras, input_dim, rank) * N -> (num_loras, input_dim, total_rank)
+                    lora_a_merged = torch.cat(lora_a_stacked, dim=-1)
+                    
+                    batch_size = x.size(0)
+                    rank_per_slice = first_rank
+                    total_rank = rank_per_slice * num_slices
+                    
+                    # Create merged buffer for shrink output (reuse or create)
+                    if buffer is None:
+                        buffer = self._get_lora_buffers(
+                            batch_size, rank_per_slice, num_slices, x.device
+                        )
+                    
+                    # Create a merged buffer view for shrink output
+                    # Shape: (batch_size, total_rank)
+                    merged_buffer_list = [buf.view(-1, rank_per_slice) for buf in buffer]
+                    merged_buffer_flat = torch.cat(merged_buffer_list, dim=-1)
+                    
+                    # Call shrink once with merged lora_a (1 kernel call vs N calls)
+                    shrink_fun: Callable = (self._shrink_prefill
+                                            if self.is_prefill else self._shrink_decode)
+                    shrink_fun(merged_buffer_flat, x, lora_a_merged, scale)
+                    
+                    # For expand: use merged buffer directly by slicing (no copy needed)
+                    # SGLang-style: expand each slice from merged buffer
+                    y_org = y
+                    y_flat = y.view(-1, y.shape[-1])
+                    expand_slice_fun: Callable = (self._expand_slice_prefill
+                                                  if self.is_prefill else
+                                                  self._expand_slice_decode)
+                    
+                    offset = 0
+                    for slice_idx in range(num_slices):
+                        slice_start = slice_idx * rank_per_slice
+                        slice_end = (slice_idx + 1) * rank_per_slice
+                        # Use merged buffer slice directly for expand (no copy)
+                        merged_buffer_slice = merged_buffer_flat[:, slice_start:slice_end]
+                        expand_slice_fun(
+                            y_flat, merged_buffer_slice, lora_b_stacked[slice_idx],
+                            offset, output_slices[slice_idx], True
+                        )
+                        offset += output_slices[slice_idx]
+                    y = y_flat.view_as(y_org)
+                    return
+        
         # Fall back to separate shrink/expand for multiple slices or when fused kernel unavailable
         if buffer is None:
             # Get LoRA rank from lora_b weights
