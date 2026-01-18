@@ -56,6 +56,10 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         # and max_lora_rank to accommodate the largest possible batch size.
         self._max_num_batched_tokens = max_num_batched_tokens
         self._init_lora_buffers(device)
+        
+        # Pre-allocate decode metadata buffers to avoid repeated allocation
+        # Similar to SGLang's optimization: pre-allocate batch info buffers
+        self._init_decode_metadata_buffers(device)
 
     def _init_lora_buffers(self, device: Union[torch.device, str]) -> None:
         """
@@ -94,6 +98,32 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             (self._max_num_batched_tokens, max_lora_rank),
             dtype=torch.float32,
             device=device
+        )
+
+    def _init_decode_metadata_buffers(self, device: Union[torch.device, str]) -> None:
+        """
+        Pre-allocate buffers for decode metadata to avoid repeated memory allocation.
+
+        For decode stage, we need:
+        - seq_len_tensor: always ones (each sequence has length 1)
+        - b_seq_start_loc: cumulative sum [0, 1, 2, ..., max_batch_size]
+        
+        These buffers can be reused and sliced for different batch sizes.
+        """
+        max_batch_size = self._max_num_batched_tokens
+        
+        # Pre-allocate seq_len buffer (will be sliced for actual batch size)
+        # For decode: seq_len is always 1 for each sequence
+        self._decode_seq_len_buffer = torch.ones(
+            max_batch_size, dtype=torch.int32, device=device
+        )
+        
+        # Pre-allocate b_seq_start_loc buffer: [0, 1, 2, ..., max_batch_size]
+        self._decode_b_seq_start_loc_buffer = torch.zeros(
+            max_batch_size + 1, dtype=torch.int32, device=device
+        )
+        self._decode_b_seq_start_loc_buffer[1:] = torch.cumsum(
+            self._decode_seq_len_buffer, dim=0
         )
 
     def _get_lora_buffers(
@@ -252,6 +282,8 @@ class PunicaWrapperNPU(PunicaWrapperBase):
         - seq_len_tensor: all ones with shape [batch_size]
         - lora_indices_tensor: token_lora_indices (each sequence corresponds to one token)
 
+        Optimization: Reuse pre-allocated buffers to avoid repeated memory allocation.
+
         Returns:
             Tuple of (b_seq_start_loc, seq_len_tensor, lora_indices_tensor, 
                      batches, max_seq_length, token_nums) for sgmv operations
@@ -263,17 +295,25 @@ class PunicaWrapperNPU(PunicaWrapperBase):
             batch_size = self.token_lora_indices.size(0)
             device = self.token_lora_indices.device
         
-        # For decode stage: each sequence has length 1
-        # Create seq_len_tensor with all ones (sequence-level, like SGLang)
+        # Optimization: Reuse pre-allocated buffers instead of creating new tensors
+        # This reduces memory allocation overhead (similar to SGLang's batch info reuse)
         if batch_size > 0:
-            seq_len_tensor = torch.ones(
-                batch_size, dtype=torch.int32, device=device
-            )
-            # b_seq_start_loc: cumulative sum of seq_lens [0, 1, 2, ..., batch_size]
-            b_seq_start_loc = torch.zeros(
-                batch_size + 1, dtype=torch.int32, device=device
-            )
-            b_seq_start_loc[1:] = torch.cumsum(seq_len_tensor, dim=0)
+            # Use sliced views of pre-allocated buffers
+            if (hasattr(self, '_decode_seq_len_buffer')
+                    and batch_size <= self._max_num_batched_tokens):
+                # Reuse pre-allocated buffer: slice to actual batch size
+                seq_len_tensor = self._decode_seq_len_buffer[:batch_size]
+                b_seq_start_loc = self._decode_b_seq_start_loc_buffer[:batch_size + 1]
+            else:
+                # Fallback: create new tensors if pre-allocated buffers not available
+                seq_len_tensor = torch.ones(
+                    batch_size, dtype=torch.int32, device=device
+                )
+                b_seq_start_loc = torch.zeros(
+                    batch_size + 1, dtype=torch.int32, device=device
+                )
+                b_seq_start_loc[1:] = torch.cumsum(seq_len_tensor, dim=0)
+            
             lora_indices_tensor = self.token_lora_indices
         else:
             seq_len_tensor = torch.zeros(0, dtype=torch.int32, device=device)
@@ -726,19 +766,9 @@ class PunicaWrapperNPU(PunicaWrapperBase):
 
         num_slices = len(output_slices)
 
-        # Optimization: Use fused kernel for single slice in decode stage
-        # This avoids intermediate buffer writes to global memory
-        if (num_slices == 1
-                and not self.is_prefill
-                and self.bgmv_fused is not None
-                and lora_a_stacked[0].dim() == 3
-                and lora_b_stacked[0].dim() == 3):
-            # Single slice decode stage: use bgmv_fused for better performance
-            lora_a = lora_a_stacked[0]
-            lora_b = lora_b_stacked[0]
-            # For single slice, y is already the correct shape
-            self.bgmv_fused(x, lora_a, lora_b, self.token_lora_indices, y, scale)
-            return
+        # Note: We no longer use bgmv_fused in decode stage to maintain consistency
+        # with our unified sgmv strategy. If a fused sgmv kernel is available in the
+        # future, we can add it here for further optimization.
 
         # Optimization: For QKV-like operations (multiple slices, same rank),
         # use merged shrink to avoid multiple kernel calls (similar to SGLang)
